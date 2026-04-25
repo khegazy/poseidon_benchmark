@@ -38,6 +38,7 @@ def get_dataset(dataset, **kwargs):
     - wave.Layer
     - wave.Gaussians
     - reaction_diffusion.AllenCahn
+    - kinet.D2Q9.WeaklyCompressible  (data_path = full path to .h5 file)
 
     Adding .out at the end of the str, returns a dataset with more time steps.
     **kwargs overwrite the default settings.
@@ -155,6 +156,13 @@ def get_dataset(dataset, **kwargs):
                 default_time_settings = {"max_num_time_steps": 7, "time_step_size": 2}
             kwargs = {**default_time_settings, **kwargs}
             from .reaction_diffusion.allen_cahn import AllenCahn as dset
+    elif "kinet" in dataset:
+        if "D2Q9.WeaklyCompressible" in dataset:
+            from .kinet.lbm import D2Q9_WeaklyCompressible as dset
+        else:
+            raise ValueError(f"Unknown dataset {dataset}")
+        default_time_settings = {"max_num_time_steps": 7, "time_step_size": 2}
+        kwargs = {**default_time_settings, **kwargs}
     else:
         raise ValueError(f"Unknown dataset {dataset}")
 
