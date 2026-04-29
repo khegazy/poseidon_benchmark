@@ -1,0 +1,65 @@
+dataset:
+  value: "fluids.compressible.Riemann"
+num_trajectories:
+  value: 1024
+model_name:
+  value: "T"
+seed:
+  value: 0
+dataloader_num_workers:
+  value: 4
+dataloader_pin_memory:
+  value: true
+dataset_kwargs:
+  value:
+    max_num_time_steps: 20
+    time_step_size: 1
+    allowed_time_transitions: [1]
+lr:
+  value: 0.00005
+lr_embedding_recovery:
+  value: 0.0005
+lr_time_embedding:
+  value: 0.0005
+weight_decay:
+  value: 0.000001
+lr_scheduler:
+  value: "cosine"
+warmup_ratio:
+  value: 0.05
+early_stopping_patience:
+  value: 20
+num_epochs:
+  value: 20
+batch_size:
+  value: 16
+max_grad_norm:
+  value: 5.0
+physics_regularization:
+  value:
+    dx: 0.0078125
+    dy: 0.0078125
+    dt_scale: 1.0
+    tau: 0.0
+    normalize: true
+    warmup_ratio: 0.1
+    density_channel: "rho"
+    velocity_channels: "velocity"
+    pressure_channel: "pressure"
+    density_floor: 0.000001
+    pressure_floor: 0.000001
+    regularizers:
+      - kind: "compressible_positivity_2d"
+        lambda_pos: 0.001
+        gamma: 1.4
+        state_layout: "primitive"
+      - kind: "compressible_euler_entropy_flux_2d"
+        lambda_local: 0.01
+        lambda_global: 0.0001
+        lambda_rollout: 0.0
+        lambda_budget: 0.0
+        lambda_relative: 0.0
+        gamma: 1.4
+        state_layout: "primitive"
+        rollout_mode: "endpoint"
+        rollout_normalization: "initial"

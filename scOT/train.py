@@ -12,6 +12,7 @@ import random
 import json
 import psutil
 import os
+import inspect
 
 os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"
 import yaml
@@ -19,7 +20,7 @@ import matplotlib.pyplot as plt
 import transformers
 from accelerate.utils import broadcast_object_list
 from scOT.trainer import TrainingArguments, Trainer
-from transformers import EarlyStoppingCallback
+from transformers import EarlyStoppingCallback, TrainerCallback
 from scOT.model import ScOT, ScOTConfig
 from mpl_toolkits.axes_grid1 import ImageGrid
 from scOT.problems.base import get_dataset, BaseTimeDataset
@@ -117,6 +118,88 @@ def create_predictions_plot(predictions, labels, wandb_prefix):
     plt.close()
 
 
+class ARStepsCurriculumCallback(TrainerCallback):
+    def __init__(self, trainer, target_ar_steps, config=None):
+        self.trainer = trainer
+        self.target_ar_steps = self._normalize_target(target_ar_steps)
+        self.config = dict(config or {})
+        self._last_ar_steps = None
+
+    def _normalize_target(self, target_ar_steps):
+        if isinstance(target_ar_steps, int):
+            return max(int(target_ar_steps), 1)
+        if isinstance(target_ar_steps, (list, tuple)):
+            target = list(target_ar_steps)
+            if len(target) == 0:
+                raise ValueError("train_ar_steps curriculum requires a non-empty target.")
+            return target
+        raise ValueError("train_ar_steps must be an int or list to use curriculum.")
+
+    def _target_length(self):
+        if isinstance(self.target_ar_steps, int):
+            return self.target_ar_steps
+        return len(self.target_ar_steps)
+
+    def _start_length(self):
+        start = int(self.config.get("start", self.config.get("start_steps", 1)))
+        return max(1, min(start, self._target_length()))
+
+    def _warmup_steps(self, state):
+        steps = self.config.get("steps", self.config.get("warmup_steps", None))
+        if steps is not None:
+            return max(int(steps), 1)
+
+        ratio = self.config.get("warmup_ratio", self.config.get("ratio", 0.5))
+        if state.max_steps is None or state.max_steps <= 0:
+            return 1
+        return max(int(float(ratio) * state.max_steps), 1)
+
+    def _scheduled_ar_steps(self, state):
+        target_length = self._target_length()
+        start_length = self._start_length()
+        if target_length <= start_length:
+            current_length = target_length
+        else:
+            progress = min(
+                max(float(state.global_step), 0.0) / float(self._warmup_steps(state)),
+                1.0,
+            )
+            current_length = start_length + int(
+                progress * float(target_length - start_length)
+            )
+            current_length = max(start_length, min(current_length, target_length))
+
+        if isinstance(self.target_ar_steps, int):
+            return current_length
+        return self.target_ar_steps[:current_length]
+
+    def _store_last_ar_steps(self, ar_steps):
+        if isinstance(ar_steps, list):
+            self._last_ar_steps = list(ar_steps)
+        else:
+            self._last_ar_steps = ar_steps
+
+    def _set_ar_steps(self, ar_steps, state):
+        if ar_steps == self._last_ar_steps:
+            return
+        self.trainer.set_ar_steps(ar_steps)
+        self._store_last_ar_steps(ar_steps)
+        if getattr(state, "is_world_process_zero", False):
+            print(f"[AR curriculum] train_ar_steps -> {ar_steps}")
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        self._set_ar_steps(self._scheduled_ar_steps(state), state)
+        return control
+
+    def on_step_begin(self, args, state, control, **kwargs):
+        self._set_ar_steps(self._scheduled_ar_steps(state), state)
+        return control
+
+    def on_train_end(self, args, state, control, **kwargs):
+        self._set_ar_steps(self.target_ar_steps, state)
+        return control
+
+
 def setup(params, model_map=True):
     config = None
     RANK = int(os.environ.get("LOCAL_RANK", -1))
@@ -151,18 +234,23 @@ def setup(params, model_map=True):
 
     ckpt_dir = "./"
     if RANK == 0 or RANK == -1:
+        run_project = run.project
+        run_name = run.name
+        if os.environ.get("WANDB_MODE", "").lower() == "disabled":
+            run_project = params.wandb_project_name
+            run_name = params.wandb_run_name or run.name
         if run.sweep_id is not None:
             ckpt_dir = (
                 params.checkpoint_path
                 + "/"
-                + run.project
+                + run_project
                 + "/"
                 + run.sweep_id
                 + "/"
-                + run.name
+                + run_name
             )
         else:
-            ckpt_dir = params.checkpoint_path + "/" + run.project + "/" + run.name
+            ckpt_dir = params.checkpoint_path + "/" + run_project + "/" + run_name
     if (RANK == 0 or RANK == -1) and not os.path.exists(ckpt_dir):
         os.makedirs(ckpt_dir)
     ls = broadcast_object_list([ckpt_dir], from_process=0)
@@ -194,6 +282,12 @@ if __name__ == "__main__":
     )
     params = read_cli(parser).parse_args()
     run, config, ckpt_dir, RANK, CPU_CORES = setup(params)
+    seed = int(config.get("seed", SEED))
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    dataloader_num_workers = int(config.get("dataloader_num_workers", CPU_CORES))
+    dataloader_pin_memory = bool(config.get("dataloader_pin_memory", True))
 
     train_eval_set_kwargs = (
         {"just_velocities": True}
@@ -202,6 +296,8 @@ if __name__ == "__main__":
     )
     if params.move_data is not None:
         train_eval_set_kwargs["move_to_local_scratch"] = params.move_data
+    if isinstance(config.get("dataset_kwargs", None), dict):
+        train_eval_set_kwargs.update(config["dataset_kwargs"])
     if params.max_num_train_time_steps is not None:
         train_eval_set_kwargs["max_num_time_steps"] = params.max_num_train_time_steps
     if params.train_time_step_size is not None:
@@ -274,10 +370,9 @@ if __name__ == "__main__":
         else None
     )
 
-    train_config = TrainingArguments(
+    training_kwargs = dict(
         output_dir=ckpt_dir,
         overwrite_output_dir=True,  #! OVERWRITE THIS DIRECTORY IN CASE, also for resuming training
-        evaluation_strategy="epoch",
         per_device_train_batch_size=config["batch_size"],
         per_device_eval_batch_size=config["batch_size"],
         eval_accumulation_steps=16,
@@ -295,6 +390,7 @@ if __name__ == "__main__":
             if (params.finetune_from is None or "lr_time_embedding" not in config)
             else config["lr_time_embedding"]
         ),
+        rollout_grad_steps=int(config.get("rollout_grad_steps", 1)),
         weight_decay=config["weight_decay"],
         adam_beta1=0.9,  # default
         adam_beta2=0.999,  # default
@@ -307,13 +403,13 @@ if __name__ == "__main__":
         logging_nan_inf_filter=False,
         save_strategy="epoch",
         save_total_limit=1,
-        seed=SEED,
+        seed=seed,
         fp16=False,
-        dataloader_num_workers=CPU_CORES,
+        dataloader_num_workers=dataloader_num_workers,
         load_best_model_at_end=True,
         metric_for_best_model="loss",
         greater_is_better=False,
-        dataloader_pin_memory=True,
+        dataloader_pin_memory=dataloader_pin_memory,
         gradient_checkpointing=False,
         auto_find_batch_size=False,
         full_determinism=False,
@@ -321,6 +417,13 @@ if __name__ == "__main__":
         report_to="wandb",
         run_name=params.wandb_run_name,
     )
+    if "eval_strategy" in inspect.signature(TrainingArguments.__init__).parameters:
+        training_kwargs["eval_strategy"] = "epoch"
+    else:
+        training_kwargs["evaluation_strategy"] = "epoch"
+    if "data_seed" in inspect.signature(TrainingArguments.__init__).parameters:
+        training_kwargs["data_seed"] = seed
+    train_config = TrainingArguments(**training_kwargs)
 
     early_stopping = EarlyStoppingCallback(
         early_stopping_patience=config["early_stopping_patience"],
@@ -397,14 +500,45 @@ if __name__ == "__main__":
                     )
             return error_statistics_
 
+    regularization_config = None
+    if "physics_regularization" in config:
+        regularization_config = config["physics_regularization"]
+    elif "entropy_regularization" in config:
+        regularization_config = config["entropy_regularization"]
+
+    callbacks = [early_stopping]
+
     trainer = Trainer(
         model=model,
         args=train_config,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         compute_metrics=compute_metrics,
-        callbacks=[early_stopping],
+        callbacks=callbacks,
+        physics_regularization_config=regularization_config,
     )
+    train_ar_steps = config.get("train_ar_steps", None)
+    if train_ar_steps not in [None, 0, 1]:
+        trainer.set_ar_steps(train_ar_steps)
+
+        curriculum_config = config.get("train_ar_steps_curriculum", None)
+        target_length = (
+            train_ar_steps
+            if isinstance(train_ar_steps, int)
+            else len(list(train_ar_steps))
+        )
+        if (
+            curriculum_config is not None
+            and bool(curriculum_config.get("enabled", True))
+            and target_length > 1
+        ):
+            trainer.add_callback(
+                ARStepsCurriculumCallback(
+                    trainer=trainer,
+                    target_ar_steps=train_ar_steps,
+                    config=curriculum_config,
+                )
+            )
 
     trainer.train(resume_from_checkpoint=params.resume_training)
     trainer.save_model(train_config.output_dir)

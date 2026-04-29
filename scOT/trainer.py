@@ -228,6 +228,7 @@ from transformers.trainer import *
 from transformers import Trainer as Trainer_
 from transformers import TrainingArguments as TrainingArguments_
 from scOT.model import LayerNorm, ConditionalLayerNorm
+from scOT.physics_regularization import build_physics_regularizer
 from dataclasses import dataclass, field
 
 
@@ -244,6 +245,12 @@ class TrainingArguments(TrainingArguments_):
         default=None,
         metadata={
             "help": "The initial learning rate for the time embedding. When not provided, falls back to `learning_rate`. Only used when embedding and recovery are also fine-tuned with different lr."
+        },
+    )
+    rollout_grad_steps: int = field(
+        default=1,
+        metadata={
+            "help": "Number of tail autoregressive states that remain attached for gradient backpropagation. Negative values keep the full rollout attached."
         },
     )
 
@@ -273,10 +280,119 @@ class TrainingArguments(TrainingArguments_):
 
 
 class Trainer(Trainer_):
-    def __init__(self, *args, **kwargs):
+    def __init__(
+        self,
+        *args,
+        physics_regularization_config=None,
+        entropy_regularization_config=None,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.ar_steps = None
         self.output_all_steps = False
+        self.physics_regularization_config = physics_regularization_config
+        if physics_regularization_config is None:
+            physics_regularization_config = entropy_regularization_config
+            self.physics_regularization_config = physics_regularization_config
+        self.physics_regularizer = build_physics_regularizer(
+            physics_regularization_config,
+            dataset=self.train_dataset,
+        )
+
+    def _physics_config_value(self, *keys, default=None):
+        config = self.physics_regularization_config
+        if config is None or not hasattr(config, "get"):
+            return default
+        for key in keys:
+            if key in config:
+                return config.get(key)
+        return default
+
+    def _physics_loss_scale(self, step_index=None):
+        scale = 1.0
+
+        warmup_steps = self._physics_config_value("warmup_steps", default=None)
+        warmup_ratio = self._physics_config_value(
+            "warmup_ratio", "physics_warmup_ratio", default=None
+        )
+        if warmup_steps is None and warmup_ratio is not None and self.state.max_steps:
+            warmup_steps = int(float(warmup_ratio) * self.state.max_steps)
+        if warmup_steps is not None:
+            warmup_steps = max(int(warmup_steps), 1)
+            scale *= min(1.0, float(self.state.global_step + 1) / warmup_steps)
+
+        step_alpha = float(
+            self._physics_config_value("rollout_weight_alpha", "step_weight_alpha", default=0.0)
+        )
+        if step_index is not None and step_alpha != 0.0:
+            scale *= 1.0 + step_alpha * float(step_index)
+
+        return scale
+
+    def _rollout_grad_steps(self, total_steps):
+        value = self._physics_config_value("rollout_grad_steps", default=None)
+        if value is None:
+            value = getattr(self.args, "rollout_grad_steps", 1)
+        if value is None:
+            return 1
+        value = int(value)
+        if value < 0:
+            return total_steps
+        return min(value, total_steps)
+
+    def _prepare_rollout_state(self, state, step_index, total_steps):
+        grad_steps = self._rollout_grad_steps(total_steps)
+        state_index = step_index + 1
+        if grad_steps > 0 and state_index > total_steps - grad_steps:
+            return state
+        return state.detach()
+
+    def _physics_regularization_loss(self, outputs, inputs, step_index=None):
+        if self.physics_regularizer is None:
+            return None
+        if "pixel_values" not in inputs or "time" not in inputs:
+            return None
+        if not hasattr(outputs, "output") or outputs.output is None:
+            return None
+
+        physics_loss = self.physics_regularizer(
+            inputs["pixel_values"],
+            outputs.output,
+            inputs["time"],
+            labels=inputs.get("labels", None),
+            step_index=step_index,
+        )
+        physics_loss = physics_loss * self._physics_loss_scale(step_index=step_index)
+        return physics_loss
+
+    def _add_physics_regularization_loss(self, outputs, inputs, step_index=None):
+        physics_loss = self._physics_regularization_loss(
+            outputs,
+            inputs,
+            step_index=step_index,
+        )
+        if physics_loss is None:
+            return outputs
+        outputs.loss = physics_loss if outputs.loss is None else outputs.loss + physics_loss
+        return outputs
+
+    def _add_physics_rollout_loss(self, outputs, rollout_states, labels=None):
+        if self.physics_regularizer is None:
+            return outputs
+        if outputs.loss is None:
+            return outputs
+        if not hasattr(self.physics_regularizer, "rollout_loss"):
+            return outputs
+        if rollout_states is None or len(rollout_states) < 2:
+            return outputs
+
+        rollout_loss = self.physics_regularizer.rollout_loss(
+            rollout_states,
+            labels=labels,
+        )
+        rollout_loss = rollout_loss * self._physics_loss_scale()
+        outputs.loss = outputs.loss + rollout_loss
+        return outputs
 
     def get_decay_parameter_names(self, model) -> List[str]:
         ALL_LAYERNORM_LAYERS = [torch.nn.LayerNorm, LayerNorm, ConditionalLayerNorm]
@@ -446,8 +562,7 @@ class Trainer(Trainer_):
 
     def set_ar_steps(self, ar_steps=None, output_all_steps=False):
         self.ar_steps = ar_steps
-        if self.ar_steps is not None and output_all_steps:
-            self.output_all_steps = True
+        self.output_all_steps = bool(self.ar_steps is not None and output_all_steps)
 
     def _model_forward(self, model, inputs):
         if self.ar_steps is not None and model.config.use_conditioning:
@@ -456,7 +571,8 @@ class Trainer(Trainer_):
             )
             # TODO: if outputs is not a dataclass this will break
             if isinstance(self.ar_steps, int):
-                inputs = {**inputs, **{"time": inputs["time"] / self.ar_steps}}
+                total_steps = self.ar_steps
+                inputs = {**inputs, **{"time": inputs["time"] / total_steps}}
                 if self.output_all_steps:
                     loss_ = []
                     outputs_ = []
@@ -464,10 +580,27 @@ class Trainer(Trainer_):
                     attentions_ = []
                     reshaped_hidden_states_ = []
                 else:
-                    loss = 0
-                for i in range(self.ar_steps):
-                    outputs = model(**inputs)
+                    loss = None
+                    physics_loss = None
+                rollout_states = [inputs["pixel_values"]]
+                for i in range(total_steps):
+                    supervised_step = self.output_all_steps or i == total_steps - 1
+                    model_inputs = (
+                        inputs
+                        if supervised_step
+                        else {
+                            key: value
+                            for key, value in inputs.items()
+                            if key not in {"labels", "pixel_mask"}
+                        }
+                    )
+                    outputs = model(**model_inputs)
                     if self.output_all_steps:
+                        outputs = self._add_physics_regularization_loss(
+                            outputs,
+                            model_inputs,
+                            step_index=i,
+                        )
                         outputs_.append(outputs.output.detach())
                         if outputs.hidden_states is not None:
                             hidden_states_.append(outputs.hidden_states)
@@ -480,25 +613,44 @@ class Trainer(Trainer_):
                         if outputs.loss is not None:
                             loss_.append(outputs.loss)
                     else:
-                        if outputs.loss is not None:
-                            loss += outputs.loss
+                        data_loss = outputs.loss if supervised_step else None
+                        step_physics_loss = self._physics_regularization_loss(
+                            outputs,
+                            model_inputs,
+                            step_index=i,
+                        )
+                        if data_loss is not None:
+                            loss = data_loss if loss is None else loss + data_loss
+                        if step_physics_loss is not None:
+                            physics_loss = (
+                                step_physics_loss
+                                if physics_loss is None
+                                else physics_loss + step_physics_loss
+                            )
+                    next_pixel_values = (
+                        outputs.output
+                        if not channel_difference
+                        else torch.cat(
+                            [
+                                outputs.output,
+                                inputs["pixel_values"][
+                                    :,
+                                    model.config.num_out_channels :,
+                                ],
+                            ],
+                            dim=1,
+                        )
+                    )
+                    next_input = self._prepare_rollout_state(
+                        next_pixel_values,
+                        step_index=i,
+                        total_steps=total_steps,
+                    )
+                    rollout_states.append(next_input)
                     inputs = {
                         **inputs,
                         **{
-                            "pixel_values": (
-                                outputs.output.detach()
-                                if not channel_difference
-                                else torch.cat(
-                                    [
-                                        outputs.output.detach(),
-                                        inputs["pixel_values"][
-                                            :,
-                                            model.config.num_out_channels :,
-                                        ],
-                                    ],
-                                    dim=1,
-                                )
-                            )
+                            "pixel_values": next_input
                         },
                     }
                 if self.output_all_steps:
@@ -519,8 +671,15 @@ class Trainer(Trainer_):
                             for rhs in zip(*reshaped_hidden_states_)
                         ]
                 else:
-                    loss /= self.ar_steps
+                    if physics_loss is not None:
+                        physics_loss = physics_loss / total_steps
+                        loss = physics_loss if loss is None else loss + physics_loss
                     outputs.loss = loss
+                    outputs = self._add_physics_rollout_loss(
+                        outputs,
+                        rollout_states,
+                        labels=inputs.get("labels", None),
+                    )
             elif isinstance(self.ar_steps, list):
                 if self.output_all_steps:
                     loss_ = []
@@ -531,14 +690,19 @@ class Trainer(Trainer_):
                 else:
                     loss = 0
                 lead_time = inputs["time"]
-                for i in self.ar_steps:
+                rollout_states = [inputs["pixel_values"]]
+                total_steps = len(self.ar_steps)
+                for step_index, i in enumerate(self.ar_steps):
                     inputs = {
                         **inputs,
                         **{"time": lead_time * i},
                     }
                     outputs = model(**inputs)
-                    if self.output_all_steps:
-                        outputs_.append(outputs.output.detach())
+                    outputs = self._add_physics_regularization_loss(
+                        outputs,
+                        inputs,
+                        step_index=step_index,
+                    )
                     if self.output_all_steps:
                         outputs_.append(outputs.output.detach())
                         if outputs.hidden_states is not None:
@@ -554,23 +718,30 @@ class Trainer(Trainer_):
                     else:
                         if outputs.loss is not None:
                             loss += outputs.loss
+                    next_pixel_values = (
+                        outputs.output
+                        if not channel_difference
+                        else torch.cat(
+                            [
+                                outputs.output,
+                                inputs["pixel_values"][
+                                    :,
+                                    model.config.num_out_channels :,
+                                ],
+                            ],
+                            dim=1,
+                        )
+                    )
+                    next_input = self._prepare_rollout_state(
+                        next_pixel_values,
+                        step_index=step_index,
+                        total_steps=total_steps,
+                    )
+                    rollout_states.append(next_input)
                     inputs = {
                         **inputs,
                         **{
-                            "pixel_values": (
-                                outputs.output.detach()
-                                if not channel_difference
-                                else torch.cat(
-                                    [
-                                        outputs.output.detach(),
-                                        inputs["pixel_values"][
-                                            :,
-                                            model.config.num_out_channels :,
-                                        ],
-                                    ],
-                                    dim=1,
-                                )
-                            )
+                            "pixel_values": next_input
                         },
                     }
                 if self.output_all_steps:
@@ -593,16 +764,28 @@ class Trainer(Trainer_):
                 else:
                     loss /= len(self.ar_steps)
                     outputs.loss = loss
+                    outputs = self._add_physics_rollout_loss(
+                        outputs,
+                        rollout_states,
+                        labels=inputs.get("labels", None),
+                    )
             else:
                 raise ValueError(
                     "num_ar_steps must be an integer or a list of integers."
                 )
         else:
             outputs = model(**inputs)
+            outputs = self._add_physics_regularization_loss(outputs, inputs)
 
         return outputs
 
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(
+        self,
+        model,
+        inputs,
+        return_outputs=False,
+        num_items_in_batch=None,
+    ):
         if self.label_smoother is not None and "labels" in inputs:
             labels = inputs.pop("labels")
         else:
