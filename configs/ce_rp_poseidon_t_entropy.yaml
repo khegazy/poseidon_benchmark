@@ -46,6 +46,7 @@ physics_regularization:
     density_channel: "rho"
     velocity_channels: "velocity"
     pressure_channel: "pressure"
+    pressure_offset: 0.215
     density_floor: 0.000001
     pressure_floor: 0.000001
     regularizers:

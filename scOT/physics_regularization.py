@@ -179,6 +179,13 @@ class PhysicsRegularizer(nn.Module):
             std = std[:, :channels]
         return state * std + mean
 
+    def pressure_offset(self):
+        if "pressure_offset" in self.config:
+            return float(self.config["pressure_offset"])
+        if "mean_pressure" in self.config:
+            return float(self.config["mean_pressure"])
+        return float(getattr(self.dataset, "mean_pressure", 0.0) or 0.0)
+
     def resolve_channels(self, value, default):
         value = default if value is None else value
         values = _as_list(value)
@@ -850,6 +857,7 @@ class CompressibleEulerEntropyFlux2D(EntropyFluxRegularizer2D):
         if layout in {"primitive", "rho_uv_p", "rho-u-v-p"}:
             velocity = self.vector(state, self.cfg("velocity_channels", "velocity"), [1, 2], 2)
             pressure = self.scalar(state, self.cfg("pressure_channel", "pressure"), [3])
+            pressure = pressure + self.pressure_offset()
             return rho_safe, velocity[:, 0], velocity[:, 1], torch.clamp(
                 pressure,
                 min=float(self.cfg("pressure_floor", 1e-8)),
@@ -972,6 +980,7 @@ class CompressiblePositivity2D(PhysicsRegularizer):
         rho_safe = torch.clamp(rho, min=float(self.cfg("density_floor", 1e-6)))
         if layout in {"primitive", "rho_uv_p", "rho-u-v-p"}:
             pressure = self.scalar(state, self.cfg("pressure_channel", "pressure"), [3])
+            pressure = pressure + self.pressure_offset()
         else:
             momentum = self.vector(state, self.cfg("momentum_channels", "momentum"), [1, 2], 2)
             total_energy = self.scalar(state, self.cfg("energy_channel", "energy"), [3])
