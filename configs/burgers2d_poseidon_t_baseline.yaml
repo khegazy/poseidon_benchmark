@@ -1,0 +1,42 @@
+dataset:
+  value: "scalar.Burgers2D"
+num_trajectories:
+  value: 4096
+model_name:
+  value: "T"
+seed:
+  value: 0
+dataloader_num_workers:
+  value: 4
+dataloader_pin_memory:
+  value: true
+dataset_kwargs:
+  value:
+    resolution: 128
+    max_num_time_steps: 20
+    time_step_size: 1
+    allowed_time_transitions: [1]
+    dt: 0.01
+    domain_radius: 2.0
+    direction: "x"
+    case_mix: "shock"
+lr:
+  value: 0.00005
+lr_embedding_recovery:
+  value: 0.0005
+lr_time_embedding:
+  value: 0.0005
+weight_decay:
+  value: 0.000001
+lr_scheduler:
+  value: "cosine"
+warmup_ratio:
+  value: 0.05
+early_stopping_patience:
+  value: 20
+num_epochs:
+  value: 20
+batch_size:
+  value: 16
+max_grad_norm:
+  value: 5.0

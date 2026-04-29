@@ -352,6 +352,9 @@ class EntropyFluxRegularizer2D(PhysicsRegularizer):
 
     def local_loss(self, previous_state, next_state, dt):
         residual = self.residual(previous_state, next_state, dt)
+        margin = int(self.cfg("interior_margin", self.cfg("boundary_trim", 0)))
+        if margin > 0:
+            residual = residual[..., margin:-margin, margin:-margin]
         return self.entropy_positive_part(residual).pow(2).mean()
 
     def global_loss(self, previous_state, next_state):
@@ -1249,7 +1252,7 @@ class Enstrophy2D(PhysicsRegularizer):
         channel = self.cfg("vorticity_channel", self.cfg("omega_channel", "omega"))
         try:
             return self.scalar(state, channel, "omega")
-        except ValueError:
+        except (ValueError, IndexError):
             velocity = self.vector(state, self.cfg("velocity_channels", "velocity"), [1, 2], 2)
             dvdx, _ = gradient_periodic_2d(
                 velocity[:, 1],
@@ -1309,11 +1312,28 @@ class TotalVariationDissipation2D(PhysicsRegularizer):
 
     def total_variation(self, state):
         state = self.selected_state(state)
-        diff_x = torch.roll(state, shifts=-1, dims=-1) - state
-        diff_y = torch.roll(state, shifts=-1, dims=-2) - state
         dx = float(self.cfg("dx", 1.0))
         dy = float(self.cfg("dy", 1.0))
         norm = str(self.cfg("norm", self.cfg("tvd_norm", "anisotropic"))).lower()
+        margin = int(self.cfg("interior_margin", self.cfg("boundary_trim", 0)))
+        if margin > 0:
+            state = state[..., margin:-margin, margin:-margin]
+            diff_x = state[..., 1:] - state[..., :-1]
+            diff_y = state[..., 1:, :] - state[..., :-1, :]
+            if norm in {"anisotropic", "l1"}:
+                return diff_x.abs().sum(dim=(1, 2, 3)) * dy + diff_y.abs().sum(
+                    dim=(1, 2, 3)
+                ) * dx
+            if norm in {"isotropic", "l2"}:
+                grad_x = (state[..., :-1, 1:] - state[..., :-1, :-1]) / max(dx, 1e-12)
+                grad_y = (state[..., 1:, :-1] - state[..., :-1, :-1]) / max(dy, 1e-12)
+                eps = float(self.cfg("tvd_eps", 1e-8))
+                density = torch.sqrt(grad_x.pow(2) + grad_y.pow(2) + eps) * dx * dy
+                return density.sum(dim=(1, 2, 3))
+            raise ValueError("TVD norm must be anisotropic/l1 or isotropic/l2.")
+
+        diff_x = torch.roll(state, shifts=-1, dims=-1) - state
+        diff_y = torch.roll(state, shifts=-1, dims=-2) - state
         if norm in {"anisotropic", "l1"}:
             density = diff_x.abs() * dy + diff_y.abs() * dx
         elif norm in {"isotropic", "l2"}:
