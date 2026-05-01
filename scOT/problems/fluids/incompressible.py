@@ -25,7 +25,10 @@ class TaylorGreenVortex(BaseTimeDataset):
         *args,
         resolution=128,
         dt=0.05,
-        viscosity=0.01,
+        viscosity=None,
+        reynolds_number=None,
+        velocity_scale=1.0,
+        length_scale=1.0,
         amplitude_min=0.8,
         amplitude_max=1.2,
         phase_jitter=True,
@@ -45,7 +48,20 @@ class TaylorGreenVortex(BaseTimeDataset):
         self.N_test = int(num_test)
         self.resolution = int(resolution)
         self.dt = float(dt)
-        self.viscosity = float(viscosity)
+        if reynolds_number is not None:
+            self.reynolds_number = float(reynolds_number)
+            viscosity_from_re = (
+                float(velocity_scale) * float(length_scale) / self.reynolds_number
+            )
+            if viscosity is not None and not np.isclose(float(viscosity), viscosity_from_re):
+                raise ValueError(
+                    "TaylorGreenVortex received inconsistent viscosity and "
+                    "reynolds_number values."
+                )
+            self.viscosity = viscosity_from_re
+        else:
+            self.reynolds_number = None
+            self.viscosity = 0.01 if viscosity is None else float(viscosity)
         self.amplitude_min = float(amplitude_min)
         self.amplitude_max = float(amplitude_max)
         self.phase_jitter = bool(phase_jitter)

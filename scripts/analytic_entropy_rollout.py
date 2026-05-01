@@ -382,6 +382,7 @@ def main():
         "steps": args.steps,
         "trajectory_index": int(global_trajectory_index),
         "dt": dt,
+        "viscosity": getattr(dataset, "viscosity", None),
         "dx": dx,
         "dy": dy,
         "substeps_per_step": args.substeps_per_step,
