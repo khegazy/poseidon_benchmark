@@ -6,6 +6,139 @@ from scOT.problems.base import BaseTimeDataset
 from scOT.problems.fluids.normalization_constants import CONSTANTS
 
 
+class TaylorGreenVortex(BaseTimeDataset):
+    """Analytic 2D Taylor-Green vortex for long autoregressive stability tests.
+
+    The default output is the macroscopic velocity field [u, v] on a square
+    periodic grid. The exact solution is
+
+        u =  A sin(x + phi_x) cos(y + phi_y) exp(-2 nu t)
+        v = -A cos(x + phi_x) sin(y + phi_y) exp(-2 nu t)
+
+    on [0, 2*pi]^2. Density/pressure channels can be included by setting
+    just_velocities=False, but the entropy-like regularizers for this benchmark
+    should operate on velocity, energy, enstrophy, and divergence.
+    """
+
+    def __init__(
+        self,
+        *args,
+        resolution=128,
+        dt=0.05,
+        viscosity=None,
+        reynolds_number=None,
+        velocity_scale=1.0,
+        length_scale=1.0,
+        amplitude_min=0.8,
+        amplitude_max=1.2,
+        phase_jitter=True,
+        tracer=False,
+        just_velocities=True,
+        num_val=256,
+        num_test=256,
+        n_max=20000,
+        seed=0,
+        **kwargs,
+    ):
+        if tracer:
+            raise ValueError("TaylorGreenVortex does not have a tracer")
+        super().__init__(*args, **kwargs)
+        self.N_max = int(n_max)
+        self.N_val = int(num_val)
+        self.N_test = int(num_test)
+        self.resolution = int(resolution)
+        self.dt = float(dt)
+        if reynolds_number is not None:
+            self.reynolds_number = float(reynolds_number)
+            viscosity_from_re = (
+                float(velocity_scale) * float(length_scale) / self.reynolds_number
+            )
+            if viscosity is not None and not np.isclose(float(viscosity), viscosity_from_re):
+                raise ValueError(
+                    "TaylorGreenVortex received inconsistent viscosity and "
+                    "reynolds_number values."
+                )
+            self.viscosity = viscosity_from_re
+        else:
+            self.reynolds_number = None
+            self.viscosity = 0.01 if viscosity is None else float(viscosity)
+        self.amplitude_min = float(amplitude_min)
+        self.amplitude_max = float(amplitude_max)
+        self.phase_jitter = bool(phase_jitter)
+        self.just_velocities = bool(just_velocities)
+        self.seed = int(seed)
+
+        coords = torch.arange(self.resolution, dtype=torch.float32)
+        coords = coords * (2.0 * np.pi / float(self.resolution))
+        self.x, self.y = torch.meshgrid(coords, coords, indexing="ij")
+
+        if self.just_velocities:
+            self.input_dim = 2
+            self.label_description = "[u,v]"
+            self.pixel_mask = torch.tensor([False, False])
+            mean = torch.tensor([0.0, 0.0]).view(2, 1, 1)
+            std = torch.tensor([0.5, 0.5]).view(2, 1, 1)
+        else:
+            self.input_dim = 4
+            self.label_description = "[rho],[u,v],[p]"
+            self.pixel_mask = torch.tensor([False, False, False, False])
+            mean = torch.tensor([1.0, 0.0, 0.0, 0.0]).view(4, 1, 1)
+            std = torch.tensor([1.0, 0.5, 0.5, 0.25]).view(4, 1, 1)
+
+        # time is already returned in physical units by __getitem__.
+        self.constants = {"mean": mean, "std": std, "time": 1.0}
+        self.post_init()
+
+    def trajectory_parameters(self, trajectory_index):
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + int(trajectory_index))
+        amplitude = self.amplitude_min + (
+            self.amplitude_max - self.amplitude_min
+        ) * torch.rand((), generator=generator).item()
+        if self.phase_jitter:
+            phase_x = 2.0 * np.pi * torch.rand((), generator=generator).item()
+            phase_y = 2.0 * np.pi * torch.rand((), generator=generator).item()
+        else:
+            phase_x = 0.0
+            phase_y = 0.0
+        return amplitude, phase_x, phase_y
+
+    def exact_state(self, trajectory_index, time_index):
+        time = float(time_index) * self.dt
+        amplitude, phase_x, phase_y = self.trajectory_parameters(trajectory_index)
+        decay = np.exp(-2.0 * self.viscosity * time)
+        x = self.x + phase_x
+        y = self.y + phase_y
+        u = amplitude * torch.sin(x) * torch.cos(y) * decay
+        v = -amplitude * torch.cos(x) * torch.sin(y) * decay
+
+        if self.just_velocities:
+            return torch.stack([u, v], dim=0)
+
+        rho = torch.ones_like(u)
+        pressure = 0.25 * amplitude**2 * (torch.cos(2.0 * x) + torch.cos(2.0 * y))
+        pressure = pressure * decay**2
+        return torch.stack([rho, u, v, pressure], dim=0)
+
+    def normalize(self, state):
+        return (state - self.constants["mean"]) / self.constants["std"]
+
+    def denormalize(self, state):
+        return state * self.constants["std"] + self.constants["mean"]
+
+    def __getitem__(self, idx):
+        i, t, t1, t2 = self._idx_map(idx)
+        trajectory_index = i + self.start
+        inputs = self.exact_state(trajectory_index, t1)
+        label = self.exact_state(trajectory_index, t2)
+        return {
+            "pixel_values": self.normalize(inputs),
+            "labels": self.normalize(label),
+            "time": float(t) * self.dt,
+            "pixel_mask": self.pixel_mask,
+        }
+
+
 class IncompressibleBase(BaseTimeDataset):
     def __init__(
         self,

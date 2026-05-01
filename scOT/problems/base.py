@@ -38,6 +38,7 @@ def get_dataset(dataset, **kwargs):
     - wave.Layer
     - wave.Gaussians
     - reaction_diffusion.AllenCahn
+    - scalar.Burgers2D
     - kinet.D2Q9.WeaklyCompressible  (data_path = full path to .h5 file)
 
     Adding .out at the end of the str, returns a dataset with more time steps.
@@ -60,6 +61,8 @@ def get_dataset(dataset, **kwargs):
                 from .fluids.incompressible import PiecewiseConstants as dset
             elif "VortexSheet" in dataset:
                 from .fluids.incompressible import VortexSheet as dset
+            elif "TaylorGreenVortex" in dataset or "TGV" in dataset:
+                from .fluids.incompressible import TaylorGreenVortex as dset
             elif "forcing" in dataset:
                 if "KolmogorovFlow" in dataset:
                     from .fluids.incompressible import KolmogorovFlow as dset
@@ -156,6 +159,16 @@ def get_dataset(dataset, **kwargs):
                 default_time_settings = {"max_num_time_steps": 7, "time_step_size": 2}
             kwargs = {**default_time_settings, **kwargs}
             from .reaction_diffusion.allen_cahn import AllenCahn as dset
+    elif "scalar" in dataset:
+        if "Burgers2D" in dataset or "Burgers" in dataset:
+            if "out" in dataset:
+                default_time_settings = {"max_num_time_steps": 20, "time_step_size": 1}
+            else:
+                default_time_settings = {"max_num_time_steps": 10, "time_step_size": 1}
+            kwargs = {**default_time_settings, **kwargs}
+            from .scalar.burgers import Burgers2D as dset
+        else:
+            raise ValueError(f"Unknown dataset {dataset}")
     elif "kinet" in dataset:
         if "D2Q9.WeaklyCompressible" in dataset:
             from .kinet.lbm import D2Q9_WeaklyCompressible as dset
